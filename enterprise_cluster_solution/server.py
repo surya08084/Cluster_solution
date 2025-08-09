@@ -66,10 +66,11 @@ def build_app() -> FastAPI:
     def list_modules() -> Dict[str, Any]:
         return {
             "preprocessing": {
-                "imputation": {"numeric": SUPPORTED_IMPUTATION_NUMERIC, "categorical": SUPPORTED_IMPUTATION_CATEG},
+                "imputation": {"numeric": SUPPORTED_IMPUTATION_NUMERIC, "categorical": SUPPORTED_IMPUTATION_CATEG, "per_column": True},
                 "scaling": SUPPORTED_SCALING,
                 "encoding": SUPPORTED_ENCODING,
                 "dim_reduction": SUPPORTED_DIMRED,
+                "features": {"include": True, "exclude": True},
                 "outliers": {"methods": ["none", "isoforest"], "default": {"method": "isoforest", "contamination": "auto"}},
             },
             "clustering": SUPPORTED_ALGOS,
@@ -90,18 +91,28 @@ def build_app() -> FastAPI:
         # basic preview using pandas
         try:
             import pandas as pd  # type: ignore
+            import numpy as np  # type: ignore
             from io import StringIO
 
             df = pd.read_csv(StringIO(content.decode("utf-8")))
             suggested_dtypes = _suggest_dtypes(df)
             missing_counts = df.isna().sum().to_dict()
             missing_pct = {c: (float(m) / max(1, int(df.shape[0])) * 100.0) for c, m in missing_counts.items()}
+            nunique = {c: int(df[c].nunique(dropna=True)) for c in df.columns}
+            # Correlation preview for up to 20 numeric columns
+            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()[:20]
+            corr_preview = None
+            if len(num_cols) >= 2:
+                corr = df[num_cols].corr(numeric_only=True).round(3).fillna(0.0)
+                corr_preview = {"columns": num_cols, "matrix": corr.values.tolist()}
             preview = {
                 "columns": df.columns.tolist(),
                 "dtypes": {c: str(t) for c, t in df.dtypes.items()},
                 "suggested_dtypes": suggested_dtypes,
+                "nunique": nunique,
                 "missing_counts": missing_counts,
                 "missing_percent": missing_pct,
+                "correlation": corr_preview,
                 "head": df.head(5).to_dict(orient="records"),
                 "num_rows": int(df.shape[0]),
                 "num_columns": int(df.shape[1]),
@@ -124,6 +135,7 @@ def build_app() -> FastAPI:
             "preprocessing": payload.get("preprocessing", {}),
             "clustering": payload.get("clustering", {}),
             "visualization": payload.get("visualization", {"method": "pca", "n_components": 2}),
+            "random_state": int(payload.get("random_state", 42)),
         }
 
         job_id = str(uuid.uuid4())
@@ -149,12 +161,14 @@ def build_app() -> FastAPI:
                 {
                     "imputation": {"numeric": "mean", "categorical": "most_frequent", "fill_value": 0},
                     "encoding": "onehot",
+                    "features": {},
                     "scaling": "standard",
                     "dim_reduction": {"method": "none"},
                     "outliers": {"method": "isoforest", "contamination": "auto"},
                 },
             ),
             "auto": True,
+            "random_state": int(payload.get("random_state", 42)),
         }
 
         job_id = str(uuid.uuid4())
@@ -162,6 +176,49 @@ def build_app() -> FastAPI:
             _jobs[job_id] = {"status": "queued", "progress": 0, "result": None, "error": None}
         background_tasks.add_task(_execute_auto, job_id, str(data_path), config)
         return {"job_id": job_id}
+
+    @app.post("/api/diagnostics")
+    async def diagnostics(payload: Dict[str, Any]) -> Dict[str, Any]:
+        dataset_id: Optional[str] = payload.get("dataset_id")
+        if not dataset_id:
+            raise HTTPException(status_code=400, detail="dataset_id required")
+        data_path = _DATA_DIR / f"{dataset_id}.csv"
+        if not data_path.exists():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        import pandas as pd  # type: ignore
+        import numpy as np  # type: ignore
+        from sklearn.cluster import KMeans  # type: ignore
+        from sklearn.metrics import silhouette_score  # type: ignore
+
+        df = pd.read_csv(data_path)
+        X, _, _ = _build_features(df, payload.get("dtype_overrides", {}), payload.get("preprocessing", {}))
+        # Outlier handling if provided
+        out_cfg = (payload.get("preprocessing", {}) or {}).get("outliers", {"method": "none"})
+        inlier_mask, _ = _handle_outliers(X, out_cfg)
+        X = X[np.array(inlier_mask)]
+
+        ks = payload.get("k_values", list(range(2, 11)))
+        sil_scores = []
+        inertia_vals = []
+        best_k = None
+        best_sil = -1.0
+        for k in ks:
+            try:
+                km = KMeans(n_clusters=int(k), n_init=10, random_state=42)
+                labels = km.fit_predict(X)
+                if len(set(labels)) < 2:
+                    sil = float("nan")
+                else:
+                    sil = float(silhouette_score(X, labels))
+                sil_scores.append(sil)
+                inertia_vals.append(float(km.inertia_))
+                if sil == sil and sil > best_sil:  # check not nan
+                    best_sil = sil
+                    best_k = int(k)
+            except Exception:
+                sil_scores.append(float("nan"))
+                inertia_vals.append(float("nan"))
+        return {"k_values": ks, "silhouette": sil_scores, "inertia": inertia_vals, "suggested_k": best_k}
 
     @app.get("/api/status/{job_id}")
     def job_status(job_id: str) -> Dict[str, Any]:
@@ -197,6 +254,17 @@ def _suggest_dtypes(df) -> Dict[str, str]:
     return suggestions
 
 
+def _apply_feature_filters(df, features_cfg: Dict[str, Any]) -> Any:
+    include = (features_cfg or {}).get("include")
+    exclude = (features_cfg or {}).get("exclude")
+    cols = list(df.columns)
+    if include:
+        cols = [c for c in cols if c in include]
+    if exclude:
+        cols = [c for c in cols if c not in exclude]
+    return df[cols]
+
+
 def _build_features(
     df, dtype_overrides: Dict[str, str], preprocessing: Dict[str, Any]
 ) -> Tuple[Any, List[str], Dict[str, Any]]:
@@ -216,6 +284,9 @@ def _build_features(
         elif kind == "datetime":
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
+    # Feature filters
+    df = _apply_feature_filters(df, (preprocessing or {}).get("features", {}))
+
     missing_summary = df.isna().sum().to_dict()
 
     # Split columns
@@ -224,6 +295,7 @@ def _build_features(
 
     # Imputation
     impute_cfg = preprocessing.get("imputation", {})
+    per_column = (impute_cfg or {}).get("per_column", {})
     num_strategy = impute_cfg.get("numeric", "mean")
     cat_strategy = impute_cfg.get("categorical", "most_frequent")
     fill_value = impute_cfg.get("fill_value", 0)
@@ -231,26 +303,35 @@ def _build_features(
     X_numeric = None
     num_feature_names: List[str] = []
     if numeric_cols:
-        num_imputer = SimpleImputer(strategy=num_strategy if num_strategy != "constant" else "constant", fill_value=fill_value)
-        X_numeric = num_imputer.fit_transform(df[numeric_cols])
+        # Per-column numeric imputation support
+        if per_column:
+            cols_arrays = []
+            for c in numeric_cols:
+                strat = per_column.get(c, {}).get("strategy", num_strategy)
+                fv = per_column.get(c, {}).get("fill_value", fill_value)
+                imp = SimpleImputer(strategy=strat if strat != "constant" else "constant", fill_value=fv)
+                cols_arrays.append(imp.fit_transform(df[[c]]))
+            X_numeric = np.hstack(cols_arrays)
+        else:
+            num_imputer = SimpleImputer(strategy=num_strategy if num_strategy != "constant" else "constant", fill_value=fill_value)
+            X_numeric = num_imputer.fit_transform(df[numeric_cols])
         num_feature_names = numeric_cols
 
     X_categ = None
     cat_feature_names: List[str] = []
     if categorical_cols:
+        # Per-column categorical imputation is equivalent to same strategy here
         cat_imputer = SimpleImputer(strategy=cat_strategy if cat_strategy != "constant" else "constant", fill_value=fill_value)
         cat_values = cat_imputer.fit_transform(df[categorical_cols].astype("string"))
         encoding = preprocessing.get("encoding", "onehot")
         if encoding == "onehot":
             encoder = OneHotEncoder(sparse=False, handle_unknown="ignore")
             X_categ = encoder.fit_transform(cat_values)
-            # Build names
             try:
                 cat_feature_names = encoder.get_feature_names_out(categorical_cols).tolist()
             except Exception:
                 cat_feature_names = [f"{categorical_cols[i]}_{j}" for i in range(len(categorical_cols)) for j in range(int(X_categ.shape[1]))]
         elif encoding == "label":
-            # Label encode each column separately then concatenate
             enc_arrays = []
             for i, col in enumerate(categorical_cols):
                 le = LabelEncoder()
@@ -262,7 +343,6 @@ def _build_features(
             X_categ = cat_values
             cat_feature_names = categorical_cols
 
-    # Concatenate features
     parts = []
     names: List[str] = []
     if X_numeric is not None:
@@ -279,7 +359,6 @@ def _build_features(
 
     X = np.concatenate(parts, axis=1)
 
-    # Scaling
     scaling = preprocessing.get("scaling", "standard")
     if scaling == "standard":
         scaler = StandardScaler()
@@ -291,7 +370,6 @@ def _build_features(
         scaler = RobustScaler()
         X = scaler.fit_transform(X)
 
-    # Optional pre-clustering dimensionality reduction (PCA only for now)
     dim_cfg = preprocessing.get("dim_reduction", {"method": "none"})
     if isinstance(dim_cfg, str):
         dim_method = dim_cfg
@@ -425,10 +503,25 @@ def _profile_clusters(X, df, labels: List[int]) -> Dict[str, Any]:
         if numeric_cols:
             desc = group[numeric_cols].describe().to_dict()
             profile["numeric_summary"] = desc
-        # representative samples: 5 head rows
         profile["examples"] = group.head(5).drop(columns=["cluster"]).to_dict(orient="records")
         result[str(cluster_id)] = profile
     return result
+
+
+def _rank_top_features(X, labels: List[int], feature_names: List[str], top_n: int = 10) -> List[Dict[str, Any]]:
+    try:
+        import numpy as np  # type: ignore
+        from sklearn.feature_selection import f_classif  # type: ignore
+
+        f_stats, pvals = f_classif(X, labels)
+        order = np.argsort(-f_stats)
+        top = []
+        for idx in order[: top_n]:
+            name = feature_names[idx] if idx < len(feature_names) else f"f{idx}"
+            top.append({"feature": name, "f_stat": float(f_stats[idx]), "p_value": float(pvals[idx])})
+        return top
+    except Exception:
+        return []
 
 
 def _handle_outliers(X, method_cfg: Dict[str, Any]) -> Tuple[List[bool], Dict[str, Any]]:
@@ -441,9 +534,7 @@ def _handle_outliers(X, method_cfg: Dict[str, Any]) -> Tuple[List[bool], Dict[st
         model = IsolationForest(random_state=42, contamination=contamination)
         preds = model.fit_predict(X)  # 1 inlier, -1 outlier
         inlier_mask = [p == 1 for p in preds]
-        outliers = int((~(model.predict(X) == 1)).sum()) if hasattr(model, "predict") else int(len(X) - sum(inlier_mask))
         return inlier_mask, {"method": "isoforest", "inliers": int(sum(inlier_mask)), "outliers": int(len(inlier_mask) - sum(inlier_mask))}
-    # fallback
     return [True] * len(X), {"method": "none", "inliers": len(X), "outliers": 0}
 
 
@@ -474,14 +565,13 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
 
         import pandas as pd  # type: ignore
         import numpy as np  # type: ignore
-        from sklearn.metrics import silhouette_score  # type: ignore
+        from sklearn.metrics import silhouette_score, silhouette_samples  # type: ignore
 
         df = pd.read_csv(data_path)
 
         X, feature_names, extras = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
         missing_summary = extras.get("missing_summary", {})
 
-        # Optional outlier handling
         out_cfg = (config.get("preprocessing", {}) or {}).get("outliers", {"method": "none"})
         inlier_mask, out_info = _handle_outliers(X, out_cfg)
         inlier_idx = np.where(np.array(inlier_mask))[0]
@@ -499,14 +589,16 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
         with _jobs_lock:
             _jobs[job_id]["progress"] = 70
 
-        # Compute silhouette if valid
         sil = None
+        sil_samples = None
         try:
             unique = set(labels)
-            if len(unique) >= 2 and (len(unique) != 1):
+            if len(unique) >= 2:
                 sil = float(silhouette_score(X_in, labels))
+                sil_samples = silhouette_samples(X_in, labels).tolist()
         except Exception:
             sil = None
+            sil_samples = None
 
         fig_json = _visualize(X_in, labels, config.get("visualization", {"method": "pca", "n_components": 2}))
 
@@ -514,6 +606,7 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
 
         counts = Counter(labels)
         profiles = _profile_clusters(X_in, df_in, labels)
+        top_features = _rank_top_features(X_in, labels, feature_names)
         artifacts = _save_artifacts(job_id, df_in, labels, df_out)
 
         with _jobs_lock:
@@ -523,10 +616,12 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
                 "labels": labels,
                 "label_counts": dict(counts),
                 "silhouette": sil,
+                "silhouette_samples": sil_samples,
                 "algorithm": config.get("clustering", {}).get("algorithm", "kmeans"),
                 "algorithm_params": algo_info,
                 "figure": fig_json,
                 "profiles": profiles,
+                "top_features": top_features,
                 "missing_summary": missing_summary,
                 "outlier_summary": out_info,
                 "artifacts": {"segmented": bool(artifacts.get("segmented")), "outliers": bool(artifacts.get("outliers"))},
@@ -549,10 +644,9 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
 
         df = pd.read_csv(data_path)
 
-        X, _, extras = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+        X, feature_names, extras = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
         missing_summary = extras.get("missing_summary", {})
 
-        # Outlier handling (auto default)
         out_cfg = (config.get("preprocessing", {}) or {}).get("outliers", {"method": "isoforest", "contamination": "auto"})
         inlier_mask, out_info = _handle_outliers(X, out_cfg)
         inlier_idx = np.where(np.array(inlier_mask))[0]
@@ -574,12 +668,7 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
             ("dbscan", {"eps": e, "min_samples": 5}) for e in (0.3, 0.5, 0.8)
         ]
 
-        best = {
-            "score": -1.0,
-            "algo": None,
-            "params": None,
-            "labels": None,
-        }
+        best = {"score": -1.0, "algo": None, "params": None, "labels": None}
 
         for algo, params in candidate_algos:
             try:
@@ -587,10 +676,8 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
                 unique = set(labels)
                 if len(unique) < 2:
                     continue
-                # For DBSCAN skip if most are noise
                 if algo == "dbscan" and labels.count(-1) > 0.5 * len(labels):
                     continue
-                # silhouette
                 if -1 in unique and len(unique) > 2:
                     mask = np.array(labels) != -1
                     score = float(silhouette_score(X_in[mask], np.array(labels)[mask]))
@@ -609,6 +696,7 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
 
         counts = Counter(best["labels"])  # type: ignore
         profiles = _profile_clusters(X_in, df_in, best["labels"])  # type: ignore
+        top_features = _rank_top_features(X_in, best["labels"], feature_names)  # type: ignore
         artifacts = _save_artifacts(job_id, df_in, best["labels"], df_out)
 
         with _jobs_lock:
@@ -622,6 +710,7 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
                 "algorithm_params": best["params"],
                 "figure": vis,
                 "profiles": profiles,
+                "top_features": top_features,
                 "missing_summary": missing_summary,
                 "outlier_summary": out_info,
                 "artifacts": {"segmented": bool(artifacts.get("segmented")), "outliers": bool(artifacts.get("outliers"))},
