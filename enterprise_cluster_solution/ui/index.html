@@ -7,14 +7,18 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; }
     header { padding: 12px 16px; background: #0f172a; color: white; }
-    main { padding: 16px; display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+    main { padding: 16px; display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
     section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
     h2 { margin: 8px 0 12px 0; font-size: 16px; }
     .btn { background: #0ea5e9; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-    .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-    input[type="number"]{ width: 80px; }
+    .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    input[type="number"]{ width: 90px; }
+    select { min-width: 140px; }
     pre { white-space: pre-wrap; word-break: break-word; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #e2e8f0; padding: 4px 6px; font-size: 13px; text-align: left; }
+    .small { font-size: 12px; color: #334155; }
   </style>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
 </head>
@@ -29,19 +33,77 @@
       <button class="btn" onclick="uploadFile()">Upload</button>
       <div id="preview"></div>
 
-      <h2>2) Configure Steps</h2>
-      <div class="row">
-        <label>Preprocessing:</label>
-        <span>StandardScaler</span>
-      </div>
-      <div class="row">
-        <label>Clustering:</label>
-        <span>KMeans</span>
-        <label>n_clusters</label>
-        <input id="n_clusters" type="number" min="2" max="20" value="3" />
+      <div id="dtypeSection" style="display:none;">
+        <h2>2) Data Types</h2>
+        <div class="small">Review and adjust detected data types per column.</div>
+        <div id="dtypeTable"></div>
       </div>
 
-      <h2>3) Run</h2>
+      <h2>3) Preprocessing</h2>
+      <div class="row">
+        <label>Impute numeric</label>
+        <select id="impute_numeric">
+          <option value="mean">mean</option>
+          <option value="median">median</option>
+          <option value="constant">constant</option>
+        </select>
+        <label>Impute categorical</label>
+        <select id="impute_categorical">
+          <option value="most_frequent">most_frequent</option>
+          <option value="constant">constant</option>
+        </select>
+        <label>Fill value</label>
+        <input id="fill_value" type="number" value="0" />
+      </div>
+      <div class="row">
+        <label>Encoding</label>
+        <select id="encoding">
+          <option value="onehot">onehot</option>
+          <option value="label">label</option>
+          <option value="none">none</option>
+        </select>
+        <label>Scaling</label>
+        <select id="scaling">
+          <option value="standard">standard</option>
+          <option value="minmax">minmax</option>
+          <option value="robust">robust</option>
+          <option value="none">none</option>
+        </select>
+        <label>Dim Reduction</label>
+        <select id="dim_method">
+          <option value="none">none</option>
+          <option value="pca">pca</option>
+        </select>
+        <label>n_components</label>
+        <input id="dim_n" type="number" value="2" min="2" max="50" />
+      </div>
+
+      <h2>4) Clustering</h2>
+      <div class="row">
+        <label>Algorithm</label>
+        <select id="algorithm" onchange="onAlgoChange()">
+          <option value="kmeans">KMeans</option>
+          <option value="agglomerative">Agglomerative</option>
+          <option value="birch">BIRCH</option>
+          <option value="dbscan">DBSCAN</option>
+          <option value="optics">OPTICS</option>
+          <option value="gmm">Gaussian Mixture</option>
+        </select>
+      </div>
+      <div id="algoParams"></div>
+
+      <h2>5) Visualization</h2>
+      <div class="row">
+        <label>Method</label>
+        <select id="viz_method">
+          <option value="pca">PCA</option>
+          <option value="tsne">t-SNE</option>
+        </select>
+        <label>Components</label>
+        <input id="viz_n" type="number" value="2" min="2" max="3" />
+      </div>
+
+      <h2>6) Run</h2>
       <button id="runBtn" class="btn" onclick="runPipeline()" disabled>Run Pipeline</button>
       <div id="status"></div>
     </section>
@@ -55,7 +117,30 @@
 
 <script>
 let datasetId = null;
-let jobId = null;
+let dtypeOverrides = {};
+
+function renderDtypeTable(preview){
+  const cols = preview.columns || [];
+  const sugg = preview.suggested_dtypes || {};
+  dtypeOverrides = { ...sugg };
+  const rows = cols.map(col => `
+    <tr>
+      <td>${col}</td>
+      <td>
+        <select onchange="dtypeOverrides['${col}']=this.value">
+          <option value="numeric" ${sugg[col]==='numeric'?'selected':''}>numeric</option>
+          <option value="categorical" ${sugg[col]==='categorical'?'selected':''}>categorical</option>
+          <option value="datetime" ${sugg[col]==='datetime'?'selected':''}>datetime</option>
+        </select>
+      </td>
+    </tr>
+  `).join('');
+  document.getElementById('dtypeTable').innerHTML = `
+    <table>
+      <thead><tr><th>Column</th><th>Type</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
 
 async function uploadFile() {
   const input = document.getElementById('file');
@@ -70,41 +155,102 @@ async function uploadFile() {
   const data = await res.json();
   datasetId = data.dataset_id;
   document.getElementById('preview').innerHTML = `<pre>${JSON.stringify(data.preview, null, 2)}</pre>`;
+  document.getElementById('dtypeSection').style.display = 'block';
+  renderDtypeTable(data.preview);
   document.getElementById('runBtn').disabled = false;
 }
 
+function onAlgoChange(){
+  const algo = document.getElementById('algorithm').value;
+  let html = '';
+  if (algo === 'kmeans') {
+    html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" /></div>`;
+  } else if (algo === 'agglomerative') {
+    html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" />
+            <label>linkage</label>
+            <select id="p_linkage"><option value="ward">ward</option><option value="average">average</option><option value="complete">complete</option><option value="single">single</option></select></div>`;
+  } else if (algo === 'birch') {
+    html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" /></div>`;
+  } else if (algo === 'dbscan') {
+    html = `<div class="row"><label>eps</label><input id="p_eps" type="number" value="0.5" step="0.1" />
+            <label>min_samples</label><input id="p_min_samples" type="number" value="5" min="1" /></div>`;
+  } else if (algo === 'optics') {
+    html = `<div class="row"><label>min_samples</label><input id="p_min_samples" type="number" value="5" min="1" /></div>`;
+  } else if (algo === 'gmm') {
+    html = `<div class="row"><label>n_components</label><input id="p_n_components" type="number" value="3" min="2" max="50" /></div>`;
+  }
+  document.getElementById('algoParams').innerHTML = html;
+}
+
+onAlgoChange();
+
 async function runPipeline() {
   if (!datasetId) { alert('Upload a dataset first'); return; }
-  const n = parseInt(document.getElementById('n_clusters').value || '3', 10);
+
+  const preprocessing = {
+    imputation: {
+      numeric: document.getElementById('impute_numeric').value,
+      categorical: document.getElementById('impute_categorical').value,
+      fill_value: parseFloat(document.getElementById('fill_value').value || '0')
+    },
+    encoding: document.getElementById('encoding').value,
+    scaling: document.getElementById('scaling').value,
+    dim_reduction: { method: document.getElementById('dim_method').value, n_components: parseInt(document.getElementById('dim_n').value || '2', 10) }
+  };
+
+  const algo = document.getElementById('algorithm').value;
+  const clustering = { algorithm: algo, params: {} };
+  if (algo === 'kmeans' || algo === 'agglomerative' || algo === 'birch') {
+    clustering.params.n_clusters = parseInt(document.getElementById('p_n_clusters').value || '3', 10);
+  }
+  if (algo === 'agglomerative') {
+    clustering.params.linkage = document.getElementById('p_linkage').value;
+  }
+  if (algo === 'dbscan') {
+    clustering.params.eps = parseFloat(document.getElementById('p_eps').value || '0.5');
+    clustering.params.min_samples = parseInt(document.getElementById('p_min_samples').value || '5', 10);
+  }
+  if (algo === 'optics') {
+    clustering.params.min_samples = parseInt(document.getElementById('p_min_samples').value || '5', 10);
+  }
+  if (algo === 'gmm') {
+    clustering.params.n_components = parseInt(document.getElementById('p_n_components').value || '3', 10);
+  }
+
+  const visualization = {
+    method: document.getElementById('viz_method').value,
+    n_components: parseInt(document.getElementById('viz_n').value || '2', 10)
+  };
+
   const payload = {
     dataset_id: datasetId,
-    steps: [
-      { id: 'standard_scaler' },
-      { id: 'kmeans', params: { n_clusters: n } },
-    ]
+    dtype_overrides: dtypeOverrides,
+    preprocessing,
+    clustering,
+    visualization
   };
+
   const res = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   if (!res.ok) { const t = await res.text(); alert('Run failed: ' + t); return; }
   const body = await res.json();
-  jobId = body.job_id;
+  const jobId = body.job_id;
   document.getElementById('status').innerText = 'Job submitted: ' + jobId;
-  pollStatus();
+  pollStatus(jobId);
 }
 
-async function pollStatus() {
-  if (!jobId) return;
+async function pollStatus(jobId) {
   const res = await fetch(`/api/status/${jobId}`);
   if (!res.ok) { document.getElementById('status').innerText = 'Status fetch failed'; return; }
   const body = await res.json();
   document.getElementById('status').innerText = `Status: ${body.status} (${body.progress || 0}%)`;
   if (body.status === 'completed') {
     const r = body.result || {};
-    document.getElementById('metrics').innerHTML = `<pre>${JSON.stringify({n_clusters: r.n_clusters, silhouette: r.silhouette}, null, 2)}</pre>`;
+    document.getElementById('metrics').innerHTML = `<pre>${JSON.stringify({algorithm: r.algorithm, params: r.algorithm_params, label_counts: r.label_counts, silhouette: r.silhouette}, null, 2)}</pre>`;
     Plotly.newPlot('plot', r.figure.data, r.figure.layout, {responsive: true});
   } else if (body.status === 'failed') {
     document.getElementById('metrics').innerHTML = `<pre>Failed: ${body.error}</pre>`;
   } else {
-    setTimeout(pollStatus, 1000);
+    setTimeout(() => pollStatus(jobId), 1000);
   }
 }
 </script>
