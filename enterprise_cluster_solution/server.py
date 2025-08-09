@@ -25,6 +25,7 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 
 SUPPORTED_ALGOS = {
     "kmeans": {"label": "KMeans", "params": {"n_clusters": 3}},
+    "kmedoids": {"label": "K-Medoids", "params": {"n_clusters": 3}},
     "agglomerative": {"label": "Agglomerative", "params": {"n_clusters": 3, "linkage": "ward"}},
     "birch": {"label": "BIRCH", "params": {"n_clusters": 3}},
     "dbscan": {"label": "DBSCAN", "params": {"eps": 0.5, "min_samples": 5}},
@@ -37,7 +38,7 @@ SUPPORTED_IMPUTATION_CATEG = ["most_frequent", "constant"]
 SUPPORTED_SCALING = ["none", "standard", "minmax", "robust"]
 SUPPORTED_ENCODING = ["none", "onehot", "label"]
 SUPPORTED_DIMRED = ["none", "pca"]
-SUPPORTED_VISUALIZATION = ["pca", "tsne"]
+SUPPORTED_VISUALIZATION = ["pca", "tsne", "umap"]
 
 
 def build_app() -> FastAPI:
@@ -124,6 +125,36 @@ def build_app() -> FastAPI:
         with _jobs_lock:
             _jobs[job_id] = {"status": "queued", "progress": 0, "result": None, "error": None}
         background_tasks.add_task(_execute_pipeline, job_id, str(data_path), config)
+        return {"job_id": job_id}
+
+    @app.post("/api/auto_run")
+    async def auto_run(payload: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, Any]:
+        dataset_id: Optional[str] = payload.get("dataset_id")
+        if not dataset_id:
+            raise HTTPException(status_code=400, detail="dataset_id required")
+        data_path = _DATA_DIR / f"{dataset_id}.csv"
+        if not data_path.exists():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+
+        # sensible defaults for preprocessing
+        config = {
+            "dtype_overrides": payload.get("dtype_overrides", {}),
+            "preprocessing": payload.get(
+                "preprocessing",
+                {
+                    "imputation": {"numeric": "mean", "categorical": "most_frequent", "fill_value": 0},
+                    "encoding": "onehot",
+                    "scaling": "standard",
+                    "dim_reduction": {"method": "none"},
+                },
+            ),
+            "auto": True,
+        }
+
+        job_id = str(uuid.uuid4())
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "queued", "progress": 0, "result": None, "error": None}
+        background_tasks.add_task(_execute_auto, job_id, str(data_path), config)
         return {"job_id": job_id}
 
     @app.get("/api/status/{job_id}")
@@ -269,6 +300,14 @@ def _cluster(X, clustering_cfg: Dict[str, Any]) -> Tuple[List[int], Dict[str, An
         info = {"n_clusters": int(n_clusters)}
         return labels.tolist(), info
 
+    if algo == "kmedoids":
+        from sklearn_extra.cluster import KMedoids  # type: ignore
+
+        n_clusters = int(params.get("n_clusters", 3))
+        model = KMedoids(n_clusters=n_clusters, random_state=42, init="k-medoids++")
+        labels = model.fit_predict(X)
+        return labels.tolist(), {"n_clusters": int(n_clusters)}
+
     if algo == "agglomerative":
         from sklearn.cluster import AgglomerativeClustering  # type: ignore
 
@@ -328,6 +367,12 @@ def _visualize(X, labels: List[int], vis_cfg: Dict[str, Any]) -> Dict[str, Any]:
         reducer = TSNE(n_components=n_components, random_state=42, init="random", learning_rate="auto")
         coords = reducer.fit_transform(X)
         x_name, y_name = "TSNE1", "TSNE2"
+    elif method == "umap":
+        import umap  # type: ignore
+
+        reducer = umap.UMAP(n_components=n_components, random_state=42)
+        coords = reducer.fit_transform(X)
+        x_name, y_name = "UMAP1", "UMAP2"
     else:
         from sklearn.decomposition import PCA  # type: ignore
 
@@ -343,6 +388,28 @@ def _visualize(X, labels: List[int], vis_cfg: Dict[str, Any]) -> Dict[str, Any]:
         title=f"Clusters ({method.upper()} Scatter)",
     )
     return json.loads(fig.to_json())
+
+
+def _profile_clusters(X, df, labels: List[int]) -> Dict[str, Any]:
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+
+    result: Dict[str, Any] = {}
+    series_labels = pd.Series(labels, name="cluster")
+    df_work = df.copy()
+    df_work["cluster"] = series_labels.values
+
+    for cluster_id, group in df_work.groupby("cluster"):
+        profile: Dict[str, Any] = {}
+        profile["size"] = int(group.shape[0])
+        numeric_cols = group.select_dtypes(include=["number"]).columns.tolist()
+        if numeric_cols:
+            desc = group[numeric_cols].describe().to_dict()
+            profile["numeric_summary"] = desc
+        # representative samples: 5 head rows
+        profile["examples"] = group.head(5).drop(columns=["cluster"]).to_dict(orient="records")
+        result[str(cluster_id)] = profile
+    return result
 
 
 def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
@@ -383,10 +450,10 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
 
         fig_json = _visualize(X, labels, config.get("visualization", {"method": "pca", "n_components": 2}))
 
-        # Label counts
         from collections import Counter
 
         counts = Counter(labels)
+        profiles = _profile_clusters(X, df, labels)
 
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
@@ -398,6 +465,87 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
                 "algorithm": config.get("clustering", {}).get("algorithm", "kmeans"),
                 "algorithm_params": algo_info,
                 "figure": fig_json,
+                "profiles": profiles,
+            }
+    except Exception as exc:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "failed"
+            _jobs[job_id]["error"] = str(exc)
+
+
+def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
+    try:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["progress"] = 5
+
+        import pandas as pd  # type: ignore
+        import numpy as np  # type: ignore
+        from sklearn.metrics import silhouette_score  # type: ignore
+
+        df = pd.read_csv(data_path)
+
+        X, _ = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+
+        candidate_algos = [
+            ("kmeans", {"n_clusters": k}) for k in (2, 3, 4, 5, 6)
+        ] + [
+            ("kmedoids", {"n_clusters": k}) for k in (2, 3, 4, 5)
+        ] + [
+            ("agglomerative", {"n_clusters": k, "linkage": "ward"}) for k in (2, 3, 4, 5)
+        ] + [
+            ("gmm", {"n_components": k}) for k in (2, 3, 4, 5)
+        ] + [
+            ("dbscan", {"eps": e, "min_samples": 5}) for e in (0.3, 0.5, 0.8)
+        ]
+
+        best = {
+            "score": -1.0,
+            "algo": None,
+            "params": None,
+            "labels": None,
+        }
+
+        for algo, params in candidate_algos:
+            try:
+                labels, _ = _cluster(X, {"algorithm": algo, "params": params})
+                unique = set(labels)
+                if len(unique) < 2:
+                    continue
+                # For DBSCAN skip if most are noise
+                if algo == "dbscan" and labels.count(-1) > 0.5 * len(labels):
+                    continue
+                # silhouette
+                if -1 in unique and len(unique) > 2:
+                    mask = np.array(labels) != -1
+                    score = float(silhouette_score(X[mask], np.array(labels)[mask]))
+                else:
+                    score = float(silhouette_score(X, labels))
+                if score > best["score"]:
+                    best = {"score": score, "algo": algo, "params": params, "labels": labels}
+            except Exception:
+                continue
+
+        if best["algo"] is None:
+            raise RuntimeError("Auto run failed to find a valid clustering")
+
+        vis = _visualize(X, best["labels"], {"method": "umap", "n_components": 2})
+        from collections import Counter
+
+        counts = Counter(best["labels"])  # type: ignore
+        profiles = _profile_clusters(X, df, best["labels"])  # type: ignore
+
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "completed"
+            _jobs[job_id]["progress"] = 100
+            _jobs[job_id]["result"] = {
+                "labels": best["labels"],
+                "label_counts": dict(counts),
+                "silhouette": best["score"],
+                "algorithm": best["algo"],
+                "algorithm_params": best["params"],
+                "figure": vis,
+                "profiles": profiles,
             }
     except Exception as exc:
         with _jobs_lock:
