@@ -3,16 +3,16 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "enterprise-cluster-solution"
-version = "0.1.0"
-description = "Enterprise-grade clustering solution with local web UI for preprocessing, clustering, and visualization."
+name = "autoaicluster"
+version = "0.2.0"
+description = "Auto AI Clustering: end-to-end segmentation via Python API or local web UI."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
   { name = "Enterprise Cluster Team" }
 ]
 license = { text = "MIT" }
-keywords = ["clustering", "ml", "fastapi", "pipeline", "visualization"]
+keywords = ["clustering", "automl", "segmentation", "fastapi", "pipeline", "visualization"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -34,14 +34,14 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/enterprise-cluster-solution"
+Homepage = "https://example.com/autoaicluster"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["enterprise_cluster_solution*"]
+include = ["enterprise_cluster_solution*", "autoaicluster*"]
 
 [tool.setuptools.package-data]
 enterprise_cluster_solution = ["ui/*", "ui/assets/*"]
