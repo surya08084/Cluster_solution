@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Enterprise Cluster Solution</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; }
+    header { padding: 12px 16px; background: #0f172a; color: white; }
+    main { padding: 16px; display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+    section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
+    h2 { margin: 8px 0 12px 0; font-size: 16px; }
+    .btn { background: #0ea5e9; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    input[type="number"]{ width: 80px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Enterprise Cluster Solution</h1>
+  </header>
+  <main>
+    <section>
+      <h2>1) Upload CSV</h2>
+      <input id="file" type="file" accept=".csv" />
+      <button class="btn" onclick="uploadFile()">Upload</button>
+      <div id="preview"></div>
+
+      <h2>2) Configure Steps</h2>
+      <div class="row">
+        <label>Preprocessing:</label>
+        <span>StandardScaler</span>
+      </div>
+      <div class="row">
+        <label>Clustering:</label>
+        <span>KMeans</span>
+        <label>n_clusters</label>
+        <input id="n_clusters" type="number" min="2" max="20" value="3" />
+      </div>
+
+      <h2>3) Run</h2>
+      <button id="runBtn" class="btn" onclick="runPipeline()" disabled>Run Pipeline</button>
+      <div id="status"></div>
+    </section>
+
+    <section>
+      <h2>Results</h2>
+      <div id="metrics"></div>
+      <div id="plot" style="width: 100%; height: 520px;"></div>
+    </section>
+  </main>
+
+<script>
+let datasetId = null;
+let jobId = null;
+
+async function uploadFile() {
+  const input = document.getElementById('file');
+  if (!input.files || input.files.length === 0) {
+    alert('Choose a CSV file');
+    return;
+  }
+  const form = new FormData();
+  form.append('file', input.files[0]);
+  const res = await fetch('/api/upload', { method: 'POST', body: form });
+  if (!res.ok) { alert('Upload failed'); return; }
+  const data = await res.json();
+  datasetId = data.dataset_id;
+  document.getElementById('preview').innerHTML = `<pre>${JSON.stringify(data.preview, null, 2)}</pre>`;
+  document.getElementById('runBtn').disabled = false;
+}
+
+async function runPipeline() {
+  if (!datasetId) { alert('Upload a dataset first'); return; }
+  const n = parseInt(document.getElementById('n_clusters').value || '3', 10);
+  const payload = {
+    dataset_id: datasetId,
+    steps: [
+      { id: 'standard_scaler' },
+      { id: 'kmeans', params: { n_clusters: n } },
+    ]
+  };
+  const res = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!res.ok) { const t = await res.text(); alert('Run failed: ' + t); return; }
+  const body = await res.json();
+  jobId = body.job_id;
+  document.getElementById('status').innerText = 'Job submitted: ' + jobId;
+  pollStatus();
+}
+
+async function pollStatus() {
+  if (!jobId) return;
+  const res = await fetch(`/api/status/${jobId}`);
+  if (!res.ok) { document.getElementById('status').innerText = 'Status fetch failed'; return; }
+  const body = await res.json();
+  document.getElementById('status').innerText = `Status: ${body.status} (${body.progress || 0}%)`;
+  if (body.status === 'completed') {
+    const r = body.result || {};
+    document.getElementById('metrics').innerHTML = `<pre>${JSON.stringify({n_clusters: r.n_clusters, silhouette: r.silhouette}, null, 2)}</pre>`;
+    Plotly.newPlot('plot', r.figure.data, r.figure.layout, {responsive: true});
+  } else if (body.status === 'failed') {
+    document.getElementById('metrics').innerHTML = `<pre>Failed: ${body.error}</pre>`;
+  } else {
+    setTimeout(pollStatus, 1000);
+  }
+}
+</script>
+</body>
+</html>
