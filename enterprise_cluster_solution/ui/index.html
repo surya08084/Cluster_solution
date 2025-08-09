@@ -7,10 +7,11 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; }
     header { padding: 12px 16px; background: #0f172a; color: white; }
-    main { padding: 16px; display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
+    main { padding: 16px; display: grid; grid-template-columns: 380px 1fr; gap: 16px; }
     section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
     h2 { margin: 8px 0 12px 0; font-size: 16px; }
     .btn { background: #0ea5e9; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
+    .btn.secondary { background: #475569; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
     input[type="number"]{ width: 90px; }
@@ -19,6 +20,7 @@
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid #e2e8f0; padding: 4px 6px; font-size: 13px; text-align: left; }
     .small { font-size: 12px; color: #334155; }
+    .downloads a { margin-right: 12px; }
   </style>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
 </head>
@@ -77,12 +79,22 @@
         <label>n_components</label>
         <input id="dim_n" type="number" value="2" min="2" max="50" />
       </div>
+      <div class="row">
+        <label>Outliers</label>
+        <select id="out_method">
+          <option value="none">none</option>
+          <option value="isoforest" selected>isoforest</option>
+        </select>
+        <label>contamination</label>
+        <input id="out_cont" type="text" value="auto" />
+      </div>
 
       <h2>4) Clustering</h2>
       <div class="row">
         <label>Algorithm</label>
         <select id="algorithm" onchange="onAlgoChange()">
           <option value="kmeans">KMeans</option>
+          <option value="kmedoids">K-Medoids</option>
           <option value="agglomerative">Agglomerative</option>
           <option value="birch">BIRCH</option>
           <option value="dbscan">DBSCAN</option>
@@ -98,13 +110,17 @@
         <select id="viz_method">
           <option value="pca">PCA</option>
           <option value="tsne">t-SNE</option>
+          <option value="umap">UMAP</option>
         </select>
         <label>Components</label>
         <input id="viz_n" type="number" value="2" min="2" max="3" />
       </div>
 
       <h2>6) Run</h2>
-      <button id="runBtn" class="btn" onclick="runPipeline()" disabled>Run Pipeline</button>
+      <div class="row">
+        <button id="runBtn" class="btn" onclick="runPipeline()" disabled>Run Pipeline</button>
+        <button id="autoBtn" class="btn secondary" onclick="autoSegment()" disabled>Auto Segment</button>
+      </div>
       <div id="status"></div>
     </section>
 
@@ -112,6 +128,8 @@
       <h2>Results</h2>
       <div id="metrics"></div>
       <div id="plot" style="width: 100%; height: 520px;"></div>
+      <div id="summaries"></div>
+      <div class="downloads" id="downloads"></div>
     </section>
   </main>
 
@@ -158,19 +176,18 @@ async function uploadFile() {
   document.getElementById('dtypeSection').style.display = 'block';
   renderDtypeTable(data.preview);
   document.getElementById('runBtn').disabled = false;
+  document.getElementById('autoBtn').disabled = false;
 }
 
 function onAlgoChange(){
   const algo = document.getElementById('algorithm').value;
   let html = '';
-  if (algo === 'kmeans') {
+  if (algo === 'kmeans' || algo === 'kmedoids' || algo === 'birch') {
     html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" /></div>`;
   } else if (algo === 'agglomerative') {
     html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" />
             <label>linkage</label>
             <select id="p_linkage"><option value="ward">ward</option><option value="average">average</option><option value="complete">complete</option><option value="single">single</option></select></div>`;
-  } else if (algo === 'birch') {
-    html = `<div class="row"><label>n_clusters</label><input id="p_n_clusters" type="number" value="3" min="2" max="50" /></div>`;
   } else if (algo === 'dbscan') {
     html = `<div class="row"><label>eps</label><input id="p_eps" type="number" value="0.5" step="0.1" />
             <label>min_samples</label><input id="p_min_samples" type="number" value="5" min="1" /></div>`;
@@ -195,12 +212,13 @@ async function runPipeline() {
     },
     encoding: document.getElementById('encoding').value,
     scaling: document.getElementById('scaling').value,
-    dim_reduction: { method: document.getElementById('dim_method').value, n_components: parseInt(document.getElementById('dim_n').value || '2', 10) }
+    dim_reduction: { method: document.getElementById('dim_method').value, n_components: parseInt(document.getElementById('dim_n').value || '2', 10) },
+    outliers: { method: document.getElementById('out_method').value, contamination: document.getElementById('out_cont').value }
   };
 
   const algo = document.getElementById('algorithm').value;
   const clustering = { algorithm: algo, params: {} };
-  if (algo === 'kmeans' || algo === 'agglomerative' || algo === 'birch') {
+  if (algo === 'kmeans' || algo === 'kmedoids' || algo === 'agglomerative' || algo === 'birch') {
     clustering.params.n_clusters = parseInt(document.getElementById('p_n_clusters').value || '3', 10);
   }
   if (algo === 'agglomerative') {
@@ -238,6 +256,35 @@ async function runPipeline() {
   pollStatus(jobId);
 }
 
+async function autoSegment() {
+  if (!datasetId) { alert('Upload a dataset first'); return; }
+
+  const preprocessing = {
+    imputation: {
+      numeric: document.getElementById('impute_numeric').value,
+      categorical: document.getElementById('impute_categorical').value,
+      fill_value: parseFloat(document.getElementById('fill_value').value || '0')
+    },
+    encoding: document.getElementById('encoding').value,
+    scaling: document.getElementById('scaling').value,
+    dim_reduction: { method: document.getElementById('dim_method').value, n_components: parseInt(document.getElementById('dim_n').value || '2', 10) },
+    outliers: { method: document.getElementById('out_method').value, contamination: document.getElementById('out_cont').value }
+  };
+
+  const payload = {
+    dataset_id: datasetId,
+    dtype_overrides: dtypeOverrides,
+    preprocessing
+  };
+
+  const res = await fetch('/api/auto_run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!res.ok) { const t = await res.text(); alert('Auto run failed: ' + t); return; }
+  const body = await res.json();
+  const jobId = body.job_id;
+  document.getElementById('status').innerText = 'Auto job submitted: ' + jobId;
+  pollStatus(jobId);
+}
+
 async function pollStatus(jobId) {
   const res = await fetch(`/api/status/${jobId}`);
   if (!res.ok) { document.getElementById('status').innerText = 'Status fetch failed'; return; }
@@ -246,7 +293,17 @@ async function pollStatus(jobId) {
   if (body.status === 'completed') {
     const r = body.result || {};
     document.getElementById('metrics').innerHTML = `<pre>${JSON.stringify({algorithm: r.algorithm, params: r.algorithm_params, label_counts: r.label_counts, silhouette: r.silhouette}, null, 2)}</pre>`;
-    Plotly.newPlot('plot', r.figure.data, r.figure.layout, {responsive: true});
+    if (r.figure) Plotly.newPlot('plot', r.figure.data, r.figure.layout, {responsive: true});
+    const summaries = {
+      missing: r.missing_summary,
+      outliers: r.outlier_summary,
+      profiles: r.profiles
+    };
+    document.getElementById('summaries').innerHTML = `<pre>${JSON.stringify(summaries, null, 2)}</pre>`;
+    const dl = [];
+    if (r.artifacts && r.artifacts.segmented) dl.push(`<a href="/api/download/${jobId}/segmented.csv" target="_blank">Download Segmented CSV</a>`);
+    if (r.artifacts && r.artifacts.outliers) dl.push(`<a href="/api/download/${jobId}/outliers.csv" target="_blank">Download Outliers CSV</a>`);
+    document.getElementById('downloads').innerHTML = dl.join('');
   } else if (body.status === 'failed') {
     document.getElementById('metrics').innerHTML = `<pre>Failed: ${body.error}</pre>`;
   } else {

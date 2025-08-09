@@ -70,6 +70,7 @@ def build_app() -> FastAPI:
                 "scaling": SUPPORTED_SCALING,
                 "encoding": SUPPORTED_ENCODING,
                 "dim_reduction": SUPPORTED_DIMRED,
+                "outliers": {"methods": ["none", "isoforest"], "default": {"method": "isoforest", "contamination": "auto"}},
             },
             "clustering": SUPPORTED_ALGOS,
             "visualization": SUPPORTED_VISUALIZATION,
@@ -93,10 +94,14 @@ def build_app() -> FastAPI:
 
             df = pd.read_csv(StringIO(content.decode("utf-8")))
             suggested_dtypes = _suggest_dtypes(df)
+            missing_counts = df.isna().sum().to_dict()
+            missing_pct = {c: (float(m) / max(1, int(df.shape[0])) * 100.0) for c, m in missing_counts.items()}
             preview = {
                 "columns": df.columns.tolist(),
                 "dtypes": {c: str(t) for c, t in df.dtypes.items()},
                 "suggested_dtypes": suggested_dtypes,
+                "missing_counts": missing_counts,
+                "missing_percent": missing_pct,
                 "head": df.head(5).to_dict(orient="records"),
                 "num_rows": int(df.shape[0]),
                 "num_columns": int(df.shape[1]),
@@ -146,6 +151,7 @@ def build_app() -> FastAPI:
                     "encoding": "onehot",
                     "scaling": "standard",
                     "dim_reduction": {"method": "none"},
+                    "outliers": {"method": "isoforest", "contamination": "auto"},
                 },
             ),
             "auto": True,
@@ -165,6 +171,16 @@ def build_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="Job not found")
             return job
 
+    @app.get("/api/download/{job_id}/{name}")
+    def download(job_id: str, name: str):
+        job_dir = _DATA_DIR / job_id
+        if name not in {"segmented.csv", "outliers.csv"}:
+            raise HTTPException(status_code=400, detail="Unknown artifact")
+        target = job_dir / name
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return FileResponse(path=str(target), filename=name)
+
     return app
 
 
@@ -183,7 +199,7 @@ def _suggest_dtypes(df) -> Dict[str, str]:
 
 def _build_features(
     df, dtype_overrides: Dict[str, str], preprocessing: Dict[str, Any]
-) -> Tuple[Any, List[str]]:
+) -> Tuple[Any, List[str], Dict[str, Any]]:
     import numpy as np  # type: ignore
     import pandas as pd  # type: ignore
     from sklearn.impute import SimpleImputer  # type: ignore
@@ -199,6 +215,8 @@ def _build_features(
             df[col] = df[col].astype("string")
         elif kind == "datetime":
             df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    missing_summary = df.isna().sum().to_dict()
 
     # Split columns
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -237,7 +255,8 @@ def _build_features(
             for i, col in enumerate(categorical_cols):
                 le = LabelEncoder()
                 enc_arrays.append(le.fit_transform(cat_values[:, i]))
-            X_categ = np.vstack(enc_arrays).T
+            import numpy as _np  # type: ignore
+            X_categ = _np.vstack(enc_arrays).T
             cat_feature_names = categorical_cols
         else:
             X_categ = cat_values
@@ -284,7 +303,7 @@ def _build_features(
         from sklearn.decomposition import PCA  # type: ignore
         X = PCA(n_components=dim_n, random_state=42).fit_transform(X)
 
-    return X, names
+    return X, names, {"missing_summary": missing_summary}
 
 
 def _cluster(X, clustering_cfg: Dict[str, Any]) -> Tuple[List[int], Dict[str, Any]]:
@@ -412,6 +431,41 @@ def _profile_clusters(X, df, labels: List[int]) -> Dict[str, Any]:
     return result
 
 
+def _handle_outliers(X, method_cfg: Dict[str, Any]) -> Tuple[List[bool], Dict[str, Any]]:
+    method = (method_cfg or {}).get("method", "none")
+    if method in (None, "none"):
+        return [True] * len(X), {"method": "none", "inliers": len(X), "outliers": 0}
+    if method == "isoforest":
+        from sklearn.ensemble import IsolationForest  # type: ignore
+        contamination = method_cfg.get("contamination", "auto")
+        model = IsolationForest(random_state=42, contamination=contamination)
+        preds = model.fit_predict(X)  # 1 inlier, -1 outlier
+        inlier_mask = [p == 1 for p in preds]
+        outliers = int((~(model.predict(X) == 1)).sum()) if hasattr(model, "predict") else int(len(X) - sum(inlier_mask))
+        return inlier_mask, {"method": "isoforest", "inliers": int(sum(inlier_mask)), "outliers": int(len(inlier_mask) - sum(inlier_mask))}
+    # fallback
+    return [True] * len(X), {"method": "none", "inliers": len(X), "outliers": 0}
+
+
+def _save_artifacts(job_id: str, df_inliers, labels_inliers: List[int], df_outliers) -> Dict[str, Any]:
+    job_dir = _DATA_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    import pandas as pd  # type: ignore
+
+    seg = df_inliers.copy()
+    seg["cluster"] = labels_inliers
+    seg_path = job_dir / "segmented.csv"
+    seg.to_csv(seg_path, index=False)
+
+    out_path = job_dir / "outliers.csv"
+    if df_outliers is not None and len(df_outliers) > 0:
+        df_outliers.to_csv(out_path, index=False)
+        outliers_present = True
+    else:
+        outliers_present = False
+    return {"segmented": str(seg_path), "outliers": (str(out_path) if outliers_present else None)}
+
+
 def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
     try:
         with _jobs_lock:
@@ -424,36 +478,43 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
 
         df = pd.read_csv(data_path)
 
-        X, feature_names = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+        X, feature_names, extras = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+        missing_summary = extras.get("missing_summary", {})
+
+        # Optional outlier handling
+        out_cfg = (config.get("preprocessing", {}) or {}).get("outliers", {"method": "none"})
+        inlier_mask, out_info = _handle_outliers(X, out_cfg)
+        inlier_idx = np.where(np.array(inlier_mask))[0]
+        outlier_idx = np.where(~np.array(inlier_mask))[0]
+
+        X_in = X[inlier_idx]
+        df_in = df.iloc[inlier_idx].reset_index(drop=True)
+        df_out = df.iloc[outlier_idx].reset_index(drop=True)
 
         with _jobs_lock:
             _jobs[job_id]["progress"] = 40
 
-        labels, algo_info = _cluster(X, config.get("clustering", {}))
+        labels, algo_info = _cluster(X_in, config.get("clustering", {}))
 
         with _jobs_lock:
             _jobs[job_id]["progress"] = 70
 
-        # Compute silhouette if valid (>=2 clusters, no single cluster)
+        # Compute silhouette if valid
         sil = None
         try:
             unique = set(labels)
             if len(unique) >= 2 and (len(unique) != 1):
-                # Filter out noise label -1 for silhouette when present
-                if -1 in unique and len(unique) > 2:
-                    mask = np.array(labels) != -1
-                    sil = float(silhouette_score(X[mask], np.array(labels)[mask]))
-                else:
-                    sil = float(silhouette_score(X, labels))
+                sil = float(silhouette_score(X_in, labels))
         except Exception:
             sil = None
 
-        fig_json = _visualize(X, labels, config.get("visualization", {"method": "pca", "n_components": 2}))
+        fig_json = _visualize(X_in, labels, config.get("visualization", {"method": "pca", "n_components": 2}))
 
         from collections import Counter
 
         counts = Counter(labels)
-        profiles = _profile_clusters(X, df, labels)
+        profiles = _profile_clusters(X_in, df_in, labels)
+        artifacts = _save_artifacts(job_id, df_in, labels, df_out)
 
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
@@ -466,6 +527,9 @@ def _execute_pipeline(job_id: str, data_path: str, config: Dict[str, Any]) -> No
                 "algorithm_params": algo_info,
                 "figure": fig_json,
                 "profiles": profiles,
+                "missing_summary": missing_summary,
+                "outlier_summary": out_info,
+                "artifacts": {"segmented": bool(artifacts.get("segmented")), "outliers": bool(artifacts.get("outliers"))},
             }
     except Exception as exc:
         with _jobs_lock:
@@ -485,7 +549,18 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
 
         df = pd.read_csv(data_path)
 
-        X, _ = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+        X, _, extras = _build_features(df, config.get("dtype_overrides", {}), config.get("preprocessing", {}))
+        missing_summary = extras.get("missing_summary", {})
+
+        # Outlier handling (auto default)
+        out_cfg = (config.get("preprocessing", {}) or {}).get("outliers", {"method": "isoforest", "contamination": "auto"})
+        inlier_mask, out_info = _handle_outliers(X, out_cfg)
+        inlier_idx = np.where(np.array(inlier_mask))[0]
+        outlier_idx = np.where(~np.array(inlier_mask))[0]
+
+        X_in = X[inlier_idx]
+        df_in = df.iloc[inlier_idx].reset_index(drop=True)
+        df_out = df.iloc[outlier_idx].reset_index(drop=True)
 
         candidate_algos = [
             ("kmeans", {"n_clusters": k}) for k in (2, 3, 4, 5, 6)
@@ -508,7 +583,7 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
 
         for algo, params in candidate_algos:
             try:
-                labels, _ = _cluster(X, {"algorithm": algo, "params": params})
+                labels, _ = _cluster(X_in, {"algorithm": algo, "params": params})
                 unique = set(labels)
                 if len(unique) < 2:
                     continue
@@ -518,9 +593,9 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
                 # silhouette
                 if -1 in unique and len(unique) > 2:
                     mask = np.array(labels) != -1
-                    score = float(silhouette_score(X[mask], np.array(labels)[mask]))
+                    score = float(silhouette_score(X_in[mask], np.array(labels)[mask]))
                 else:
-                    score = float(silhouette_score(X, labels))
+                    score = float(silhouette_score(X_in, labels))
                 if score > best["score"]:
                     best = {"score": score, "algo": algo, "params": params, "labels": labels}
             except Exception:
@@ -529,11 +604,12 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
         if best["algo"] is None:
             raise RuntimeError("Auto run failed to find a valid clustering")
 
-        vis = _visualize(X, best["labels"], {"method": "umap", "n_components": 2})
+        vis = _visualize(X_in, best["labels"], {"method": "umap", "n_components": 2})
         from collections import Counter
 
         counts = Counter(best["labels"])  # type: ignore
-        profiles = _profile_clusters(X, df, best["labels"])  # type: ignore
+        profiles = _profile_clusters(X_in, df_in, best["labels"])  # type: ignore
+        artifacts = _save_artifacts(job_id, df_in, best["labels"], df_out)
 
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
@@ -546,6 +622,9 @@ def _execute_auto(job_id: str, data_path: str, config: Dict[str, Any]) -> None:
                 "algorithm_params": best["params"],
                 "figure": vis,
                 "profiles": profiles,
+                "missing_summary": missing_summary,
+                "outlier_summary": out_info,
+                "artifacts": {"segmented": bool(artifacts.get("segmented")), "outliers": bool(artifacts.get("outliers"))},
             }
     except Exception as exc:
         with _jobs_lock:
