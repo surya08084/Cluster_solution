@@ -52,3 +52,7 @@ class ClusteringSolution:
             except Exception:
                 pass
         return url
+
+
+# Re-export Python API for direct usage
+from .python_api import run_pipeline, auto_segment  # noqa: E402,F401
