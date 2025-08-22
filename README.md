@@ -1,3 +1,6 @@
+
+[![PyPI Downloads](https://static.pepy.tech/badge/autoaicluster)](https://pepy.tech/projects/autoaicluster)
+
 # Auto AI Cluster
 
 End-to-end clustering (segmentation) via Python API or local web UI.
